@@ -1,0 +1,28 @@
+# Secrets and operator configuration
+.env
+.env.*
+secrets/
+credentials/
+server.cfg
+*.key
+*.pem
+*password*.txt
+*token*.json
+
+# Local environments and runtime data
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+backups/
+*.db
+*.db-*
+*.rdb
+*.log
+*.log.*
+*.zip
+*.tar
+*.tar.*
+tmp/

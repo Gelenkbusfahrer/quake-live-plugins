@@ -1,0 +1,679 @@
+"""
+This is a plugin created by ShiN0
+Copyright (c) 2023 ShiN0
+<https://www.github.com/mgaertne/minqlx-plugin-tests>
+
+You are free to modify this plugin to your own one.
+
+You need to install openai in your python installation, i.e. python3 -m pip install -U openai
+"""
+
+import re
+import time
+import asyncio
+import json
+from datetime import datetime, timezone
+from pathlib import Path
+from threading import Lock, RLock
+
+import redis
+
+import emoji
+
+# noinspection PyPackageRequirements
+import tiktoken
+from openai import OpenAIError, AsyncOpenAI
+
+import minqlx
+from minqlx import Plugin, CHAT_CHANNEL
+from minqlx.database import Redis
+
+DATETIMEFORMAT = "%Y%m%d%H%M%S"
+
+CHAT_BOT_LOG = "minqlx:openai_bot:log"
+_CHAT_HISTORY_BATCH_SIZE = 32
+_REPLY_PRIMING_TOKENS = 2
+
+
+def _token_encoding(model):
+    try:
+        return tiktoken.encoding_for_model(model)
+    except KeyError:
+        return tiktoken.get_encoding("cl100k_base")
+
+
+def _message_token_count(message, encoding):
+    num_tokens = 4  # every message follows <im_start>{role/name}\n{content}<im_end>\n
+    for key, value in message.items():
+        num_tokens += len(encoding.encode(value))
+        if key == "name":  # if there's a name, the role is omitted
+            num_tokens -= 1  # role is always required and always 1 token
+    return num_tokens
+
+
+def num_tokens_from_messages(messages, *, model="gpt-3.5-turbo-0301"):
+    """Returns the number of tokens used by a list of messages."""
+    encoding = _token_encoding(model)
+    return _REPLY_PRIMING_TOKENS + sum(
+        _message_token_count(message, encoding) for message in messages
+    )
+
+
+# noinspection PyPep8Naming
+class openai_bot(Plugin):
+    """
+    This plugin offers a customizeable openai chat bot in your server using the completion API from openai.
+
+    For this plugin to work, you need to provide an API key from openai, potentially with added costs applied according
+    to their terms of service. Please check their pricing for the model you configure here. You may also want to set a
+    hard limit for the spendings at their platform.
+
+    For explanations on the various parameters for the openai API, please consult the openai API documentation.
+
+    Uses:
+    * qlx_openai_botname (default: "Bob") The name of the bot as it will appear in in-game chat.
+    * qlx_openai_clanprefix (default: "") An optional clan prefix that will show up whenever your bot says something.
+    * qlx_openai_bot_triggers (default: "") Comma-separated list of bot triggers to use in addition to the bot's name
+    * qlx_openai_model (default: "gpt-3.5-turbo") The AI model used for creating chat interactions.
+    * qlx_openai_max_tokens (default: 1024, max: 4096) The maximum amount of tokens a completion may consume.
+    * qlx_openai_max_chat_history_tokens (default: 512) Maximum number of tokens the chat history may consume.
+            Values are limited to be between 0 and 4096.
+    * qlx_openai_temperature (default: 1.0) What sampling temperature to use, between 0 and 2.
+    * qlx_openai_top_p (default: 1.0) An alternative to sampling with temperature, called nucleus sampling.
+    * qlx_openai_frequency_penalty (default: 0.0) Number between -2.0 and 2.0. Positive values penalize new tokens
+            based on their existing frequency in the text so far, decreasing the model's likelihood to repeat the same
+            line verbatim.
+    * qlx_openai_presence_penalty (default: 0.0) Number between -2.0 and 2.0. Positive values penalize new tokens
+            based on whether they appear in the text so far, increasing the model's likelihood to talk about new topics.
+    * qlx_openai_greet_joiners (default: 1 or True) greet joiners upon messages within the greeting_delay
+    * qlx_openai_greeting_delay (default: 60) amount of seconds where newly connected players will be greeted upon
+            their first message regardless of bot mentioning
+    * qlx_openai_extended_logging (default 0 or False) enable or disable extended logging of chat contexts
+    """
+
+    database = Redis  # type: ignore
+
+    def __init__(self):
+        super().__init__()
+
+        self.queue_lock = RLock()
+        self._guard_comment_lock = Lock()
+        self.set_cvar_once("qlx_openai_botname", "Bob")
+        self.set_cvar_once("qlx_openai_clanprefix", "")
+        self.set_cvar_once("qlx_openai_bot_triggers", "")
+        self.set_cvar_once("qlx_openai_model", "gpt-3.5-turbo")
+        self.set_cvar_limit_once("qlx_openai_max_tokens", 1024, 0, 4096)
+        self.set_cvar_limit_once("qlx_openai_max_chat_history_tokens", 512, 0, 4096)
+        self.set_cvar_limit_once("qlx_openai_temperature", 1.0, 0.0, 2.0)
+        self.set_cvar_limit_once("qlx_openai_top_p", 1.0, 0.0, 2.0)
+        self.set_cvar_limit_once("qlx_openai_frequency_penalty", 0.0, -2.0, 2.0)
+        self.set_cvar_limit_once("qlx_openai_presence_penalty", 0.0, -2.0, 2.0)
+        self.set_cvar_once(
+            "qlx_openai_system_context",
+            "You are {bot_name}, a spectator on a QuakeLive server.",
+        )
+        self.set_cvar_once("qlx_openai_bot_mood", "")
+        self.set_cvar_once("qlx_openai_greet_joiners", "1")
+        self.set_cvar_once("qlx_openai_greeting_delay", "60")
+        self.set_cvar_once("qlx_openai_extended_logging", "0")
+
+        self.bot_api_key = self.get_cvar("qlx_openai_apikey")
+        self.bot_name = self.get_cvar("qlx_openai_botname") or "Bob"
+        self.bot_triggers = self.get_cvar("qlx_openai_bot_triggers", list) or []
+        self.bot_triggers = [
+            trigger for trigger in self.bot_triggers if len(trigger) > 0
+        ]
+        self.bot_clanprefix = self.get_cvar("qlx_openai_clanprefix") or ""
+        self.model = self.get_cvar("qlx_openai_model") or "gpt-3.5-turbo"
+        self.max_tokens = self.get_cvar("qlx_openai_max_tokens", int) or 100
+        self.max_chat_history_tokens = (
+            self.get_cvar("qlx_openai_max_chat_history_tokens", int) or 512
+        )
+        self.temperature = self.get_cvar("qlx_openai_temperature", float) or 1.0
+        if self.temperature < 0 or self.temperature > 2:
+            self.temperature = 1.0
+        self.top_p = self.get_cvar("qlx_openai_top_p", float) or 1.0
+        if self.top_p < 0 or self.top_p > 2:
+            self.top_p = 1.0
+        self.frequency_penalty = (
+            self.get_cvar("qlx_openai_frequency_penalty", float) or 0.0
+        )
+        if self.frequency_penalty < -2.0 or self.frequency_penalty > 2.0:
+            self.frequency_penalty = 0.0
+        self.presence_penalty = (
+            self.get_cvar("qlx_openai_presence_penalty", float) or 0.0
+        )
+        if self.presence_penalty < -2.0 or self.presence_penalty > 2.0:
+            self.presence_penalty = 0.0
+        self.extended_logging = (
+            self.get_cvar("qlx_openai_extended_logging", bool) or False
+        )
+
+        self.greet_joiners = self.get_cvar("qlx_openai_greet_joiners", bool)
+        self.greeting_delay = self.get_cvar("qlx_openai_greeting_delay", int) or 60
+        self.recently_connected_steam_ids = set()
+        self.map_authors_cache = {}
+        self.cache_map_authors_from_db()
+
+        self.add_hook("chat", self.handle_chat)
+        self.add_hook("player_connect", self.handle_player_connect)
+        self.add_hook("game_countdown", self.handle_game_countdown)
+        self.add_hook("round_start", self.handle_round_start)
+        self.add_hook("round_end", self.handle_round_end)
+        self.add_hook("game_end", self.handle_game_end)
+
+        self.add_command("listmodels", self.cmd_list_models, permission=5)
+        self.add_command(
+            "switchmodel", self.cmd_switch_model, permission=5, usage="[modelname]"
+        )
+
+    def read_context_for(self, event):
+        context_path = Path(self.get_cvar("qlx_pluginsPath")) / f"openai_bot_{event}.txt"
+        
+        if not context_path.exists():
+            return ""
+        with context_path.open(mode="r") as file:
+            return "".join(file.readlines())
+             
+    def system_context(self):
+        return self.read_context_for("system_context")
+
+    def bot_role_chat(self):
+        return self.read_context_for("role_chat")
+
+    def bot_role_gamestart(self):
+        return self.read_context_for("role_gamestart")
+
+    def bot_role_roundstart(self):
+        return self.read_context_for("role_roundstart")
+
+    def bot_role_roundend(self):
+        return self.read_context_for("role_roundend")
+
+    def bot_role_gameend(self):
+        return self.read_context_for("role_gameend")
+
+    def bot_role_weird_stats(self):
+        return self.read_context_for("role_weird_stats")
+
+    def bot_role_balance_guard(self):
+        return self.read_context_for("role_balance_guard")
+
+    def comment_balance_guard(self, facts, is_current, finished):
+        """Request one optional comment; callbacks and delivery run on the game frame.
+
+        This bridge accepts anonymous rule findings, never commands or chat history.
+        It deliberately drops requests when Bob is busy instead of queuing them.
+        """
+        if not self._guard_comment_lock.acquire(False):
+            return False
+        try:
+            payload = json.dumps(facts, ensure_ascii=False, allow_nan=False)
+            self._balance_guard_worker(payload, is_current, finished)
+        except Exception as error:
+            self._guard_comment_lock.release()
+            self.logger.debug("Guard comment dispatch failed: %s", type(error).__name__)
+            return False
+        return True
+
+    @minqlx.thread
+    def _balance_guard_worker(self, payload, is_current, finished):
+        response = None
+        acquired = self.queue_lock.acquire(False)
+        try:
+            if acquired:
+                role = self.bot_role_balance_guard().strip()
+                chat_role = self.bot_role_chat().strip()
+                if role and chat_role:
+                    fields = {
+                        "bot_name": Plugin.clean_text(self.bot_name),
+                        "game_state": payload,
+                        "current_timestamp": datetime.now().astimezone().isoformat(timespec="seconds"),
+                    }
+                    messages = [
+                        {"role": "system", "content": self.system_context().format(**fields)},
+                        {"role": "system", "content": chat_role.format(**fields)},
+                        {"role": "system", "content": role.format(**fields)},
+                        {"role": "user", "content": payload},
+                    ]
+                    response = self._balance_guard_completion(messages)
+        except Exception as error:
+            # No prompt, response, API exception text or credentials in diagnostics.
+            self.logger.debug("Guard comment skipped: %s", type(error).__name__)
+        finally:
+            if acquired:
+                self.queue_lock.release()
+
+        @minqlx.next_frame
+        def deliver():
+            sent = False
+            try:
+                if response and self.plugins.get("openai_bot") is self and is_current():
+                    self._send_message(CHAT_CHANNEL, response, relay_discord=False)
+                    sent = True
+            except Exception as error:
+                self.logger.debug("Guard comment delivery failed: %s", type(error).__name__)
+            finally:
+                self._guard_comment_lock.release()
+                finished(sent)
+
+        try:
+            deliver()
+        except Exception as error:
+            self._guard_comment_lock.release()
+            self.logger.debug("Guard frame scheduling failed: %s", type(error).__name__)
+
+    def _balance_guard_completion(self, messages):
+        async def bounded_completion():
+            return await asyncio.wait_for(self._completion(messages, safe_errors=True), timeout=8)
+
+        completion = asyncio.run(bounded_completion())
+        if completion is None:
+            return None
+        text = self._cleanup_choice(" ".join(self._pick_choice(completion).split()))
+        if not text:
+            return None
+        text = " ".join(text.split()).replace("%", " percent")
+        if len(text) > 240 or re.search(r"\b(test|simulation|simuliert)\b", text, re.IGNORECASE):
+            return None
+        # Additional guard against obvious claims of actions this observer never took.
+        if re.search(
+            r"\b(hab|habe|hat|haben)\b.{0,60}\b(gestoppt|verhindert|abgebrochen|verschoben|geswitcht|korrigiert)\b",
+            text,
+            re.IGNORECASE,
+        ):
+            return None
+        return text
+        
+    @minqlx.thread
+    def cache_map_authors_from_db(self):
+        for key in self.db.keys("minqlx:maps:*:authors"):
+            mapname = key.replace("minqlx:maps:", "").replace(":authors", "")
+            self.map_authors_cache[mapname] = self.db[key]
+
+    def summarize_game_end_stats(self, announcements):
+        @minqlx.thread
+        def threaded_summary(messages):
+            response = self._gather_completion(messages)
+            if response is None:
+                return
+            response = response.replace("%", " percent")
+            self._send_message(minqlx.CHAT_CHANNEL, response)
+
+        if len(self.bot_role_weird_stats) == 0:
+            return
+
+        weird_stats_context = self.bot_role_weird_stats.format(
+            bot_name=Plugin.clean_text(self.bot_name),
+            game_state=self.current_game_state(),
+        ).strip()
+
+        contextualized_messages = [
+            {"role": "user", "content": "You use sarcasm and slang."},
+            {
+                "role": "user",
+                "content": f"{weird_stats_context}: {Plugin.clean_text(announcements)}.",
+            },
+        ]
+        threaded_summary(contextualized_messages)
+
+    async def _completion(self, messages, *, safe_errors=False):
+        client = AsyncOpenAI(api_key=self.bot_api_key)
+        try:
+            return await client.chat.completions.create(
+                model=self.model,
+                messages=messages,
+                max_completion_tokens=self.max_tokens,
+                n=1,
+                top_p=self.top_p,
+                stop=None,
+                temperature=self.temperature,
+                frequency_penalty=self.frequency_penalty,
+                presence_penalty=self.presence_penalty,
+            )
+        except OpenAIError as e:
+            if safe_errors:
+                self.logger.debug("Guard API request failed: %s", type(e).__name__)
+            else:
+                self.logger.debug(f"Exception from openai API: {e}")
+            return None
+
+    def _gather_completion(self, messages):
+        completion = asyncio.run(self._completion(messages))
+        return self._cleanup_choice(self._pick_choice(completion))
+
+    @staticmethod
+    def _pick_choice(completion):
+        return completion.choices.pop().message.content.lstrip().rstrip()
+
+    @staticmethod
+    def _cleanup_choice(response):
+        if len(response) == 0:
+            return None
+        matcher = re.compile(r"^(\w+: )?(.*)")
+        match = matcher.match(response)
+        while match is not None and match.groups()[0] is not None:
+            match = matcher.match(match.groups()[1])
+        if match is None:
+            return response
+
+        return match.groups()[1].lstrip('"').rstrip('"')
+
+    @minqlx.thread
+    def _record_chat_line(self, message, *, lock):
+        with lock:
+            if redis.VERSION >= (3,):
+                self.db.zadd(
+                    CHAT_BOT_LOG,
+                    {message: int(datetime.strftime(datetime.now(), DATETIMEFORMAT))},
+                )
+            else:
+                self.db.zadd(
+                    CHAT_BOT_LOG,
+                    int(datetime.strftime(datetime.now(), DATETIMEFORMAT)),
+                    message,
+                )
+
+    def _send_message(self, communication_channel, message, *, relay_discord=True):
+        communication_channel.reply(
+            f"{self.bot_clanprefix}^7{self.bot_name}^7: ^2{self._ql_cleaned_up(message)}"
+        )
+
+        # noinspection PyProtectedMember
+        if relay_discord and "mydiscordbot" in Plugin._loaded_plugins:
+            # noinspection PyProtectedMember
+            discord_plugin = Plugin._loaded_plugins["mydiscordbot"]
+            # noinspection PyUnresolvedReferences
+            discord_plugin.discord.relay_message(
+                Plugin.clean_text(
+                    f"**{self.bot_clanprefix}{self.bot_name}**: {message}"
+                )
+            )
+
+    def _ql_cleaned_up(self, message):
+        cleaned_up = emoji.demojize(message, delimiters=("#", " ")).replace("  ", " ")
+        if self.db.exists("minqlx:openai_bot:message_replacements"):
+            replacements = self.db.hgetall("minqlx:openai_bot:message_replacements")
+            for original, replacement in replacements.items():
+                if original in cleaned_up:
+                    cleaned_up = cleaned_up.replace(f"{original} ", f"{replacement} ")
+        return cleaned_up
+
+    def handle_chat(self, player, msg, channel):
+        @minqlx.thread
+        def threaded_response(communication_channel, chatter, message):
+            with self.queue_lock:
+                request = f"{chatter.clean_name}: {message}"
+
+                if not self.is_triggered_message(msg) and (
+                    not self.greet_joiners
+                    or chatter.steam_id not in self.recently_connected_steam_ids
+                ):
+                    self._record_chat_line(request, lock=self.queue_lock)
+                    return
+
+                if chatter.steam_id in self.recently_connected_steam_ids:
+                    self.recently_connected_steam_ids.remove(chatter.steam_id)
+
+                message_history = self.contextualized_chat_history(
+                    request, trigger_template=self.get_role_template("chat")
+                )
+                self._record_chat_line(request, lock=self.queue_lock)
+
+                response = self._gather_completion(message_history)
+                if response is None:
+                    return
+                self._record_chat_line(
+                    f"{Plugin.clean_text(self.bot_name)}: {response}",
+                    lock=self.queue_lock,
+                )
+                self._send_message(communication_channel, response)
+
+        if channel not in [CHAT_CHANNEL]:
+            return
+
+        if msg.startswith("!"):
+            return
+
+        matcher = re.compile(r"\w")
+        if len(set(matcher.findall(Plugin.clean_text(msg)))) <= 3:
+            return
+
+        threaded_response(channel, player, msg)
+
+    def is_triggered_message(self, message):
+        matchers = [
+            rf"^{trigger}\W|\W{trigger}\W|\W{trigger}$"
+            for trigger in self.bot_triggers + [Plugin.clean_text(self.bot_name)]
+        ]
+        pattern = "|".join(matchers)
+        return re.search(pattern, Plugin.clean_text(message), flags=re.IGNORECASE)
+
+    def _recent_chat_history(self):
+        """Read newest entries in bounded batches; callers hold queue_lock."""
+        offset = 0
+        while True:
+            batch = self.db.zrevrange(
+                CHAT_BOT_LOG,
+                offset,
+                offset + _CHAT_HISTORY_BATCH_SIZE - 1,
+                withscores=True,
+            )
+            yield from batch
+            if len(batch) < _CHAT_HISTORY_BATCH_SIZE:
+                return
+            offset += len(batch)
+
+    def contextualized_chat_history(self, request, *, trigger_template=None):
+        game_state = self.current_game_state()
+        current_timestamp = datetime.now(
+            datetime.now(timezone.utc).astimezone().tzinfo
+        ).strftime("%m/%d/%y %H:%M %Z")
+        formatted_system_context = self.system_context().format(
+            bot_name=Plugin.clean_text(self.bot_name),
+            game_state=game_state,
+            current_timestamp=current_timestamp,
+        )
+
+        system_context = {
+            "role": "system",
+            "content": formatted_system_context,
+        }
+
+        chat_history_messages = [{"role": "user", "content": request}]
+        if (
+            trigger_template is not None
+            and len(
+                trigger_template.format(
+                    bot_name=Plugin.clean_text(self.bot_name), game_state=game_state
+                ).strip()
+            )
+            > 0
+        ):
+            chat_history_messages.append(
+                {
+                    "role": "user",
+                    "content": trigger_template.format(
+                        bot_name=Plugin.clean_text(self.bot_name), game_state=game_state
+                    ),
+                }
+            )
+
+        history_tokens = None
+        encoding = None
+        for message, score in self._recent_chat_history():
+            if history_tokens is None:
+                encoding = _token_encoding(self.model)
+                history_tokens = _REPLY_PRIMING_TOKENS + sum(
+                    _message_token_count(entry, encoding)
+                    for entry in chat_history_messages + [system_context]
+                )
+            else:
+                # Keep the pre-append limit check; count only the newest addition.
+                history_tokens += _message_token_count(chat_history_messages[-1], encoding)
+            if history_tokens >= self.max_chat_history_tokens:
+                self.db.zremrangebyscore(CHAT_BOT_LOG, "-INF", score)
+                break
+            role = (
+                "assistant"
+                if message.startswith(Plugin.clean_text(self.bot_name))
+                else "user"
+            )
+            chat_history_messages.append({"role": role, "content": message})
+        chat_history_messages.append(system_context)
+        chat_history_messages.reverse()
+
+        if self.extended_logging:
+            self.logger.debug(f"chat_history_messages = {chat_history_messages}")
+
+        return chat_history_messages
+
+    def current_game_state(self):
+        game = self.game
+        if game is None:
+            return ""
+
+        teams = Plugin.teams()
+        vs = min(len(teams["red"]), len(teams["blue"]))
+        team_status = self.team_status()
+        map_title = minqlx._map_title if minqlx._map_title else game.map
+        author = self.map_authors_cache.get(game.map, None)
+
+        if author is not None:
+            return (
+                f"Match state: {vs}v{vs} {game.state.replace('_', ' ').lower()}\n"
+                f"{team_status}\nCurrent map(author): {map_title}({Plugin.clean_text(author)})\n"
+                f"Game type: {game.factory_title}"
+            )
+
+        return (
+            f"Match state: {vs}v{vs} {game.state.replace('_', ' ').lower()}\n"
+            f"{team_status}\nCurrent map: {map_title}\nGame type: {game.factory_title}"
+        )
+
+    def team_status(self):
+        game = self.game
+        if game is None:
+            return ""
+
+        teams = Plugin.teams()
+        team_status = (
+            "nick|team|dmg\n" if self.game.state == "in_progress" else "nick|team\n"
+        )
+        for team in ["red", "blue", "spectator"]:
+            if len(teams[team]) == 0:
+                continue
+            for player in teams[team]:
+                if self.game.state == "in_progress":
+                    team_status += (
+                        f"{player.clean_name}|{player.team}|"
+                        f"{player.stats.damage_dealt}\n"
+                    )
+                else:
+                    team_status += f"{player.clean_name}|{player.team}\n"
+
+        team_status += (
+            f"{Plugin.clean_text(self.bot_name)}|spectator|0"
+            if self.game.state == "in_progress"
+            else f"{Plugin.clean_text(self.bot_name)}|spectator"
+        )
+        return team_status
+
+    def handle_player_connect(self, player):
+        self.recently_connected_steam_ids.add(player.steam_id)
+        self._remove_recently_connected(player.steam_id)
+
+    @minqlx.thread
+    def _remove_recently_connected(self, steam_id):
+        time.sleep(self.greeting_delay)
+        if steam_id in self.recently_connected_steam_ids:
+            self.recently_connected_steam_ids.remove(steam_id)
+
+    def get_role_template(self, trigger):
+        return self.__getattribute__(f"bot_role_{trigger}")()
+
+    @minqlx.thread
+    def threaded_response(self, trigger):
+        attribute = self.get_role_template(trigger)
+        if len(attribute) == 0:
+            return
+
+        with self.queue_lock:
+            message_history = self.contextualized_chat_history(attribute)
+
+            response = self._gather_completion(message_history)
+            if response is None:
+                return
+            self._send_message(minqlx.CHAT_CHANNEL, response)
+
+    def handle_game_countdown(self):
+        if not self.game:
+            return
+        self.threaded_response("gamestart")
+
+    def handle_round_start(self, _roundnumber):
+        if not self.game:
+            return
+        self.threaded_response("roundstart")
+
+    def handle_round_end(self, _data):
+        if not self.game:
+            return
+        self.threaded_response("roundend")
+
+    @minqlx.delay(1)
+    def handle_game_end(self, _data):
+        self.cache_map_authors_from_db()
+
+        if not self.game:
+            return
+        self.threaded_response("gameend")
+
+        mapname = self.game.map_title if self.game.map_title else self.game.map
+        self._record_chat_line(
+            f"Match ended {self.game.red_score}(red) - {self.game.blue_score}(blue) on {mapname}",
+            lock=self.queue_lock,
+        )
+
+    def cmd_list_models(self, player, _msg, _channel):
+        self._list_models_in_thread(player)
+
+    @minqlx.thread
+    def _list_models_in_thread(self, player):
+        async def _list_models_async():
+            client = AsyncOpenAI(api_key=self.bot_api_key)
+            return await client.models.list()
+
+        available_models = asyncio.run(_list_models_async())
+
+        formatted_models = ", ".join([model.id for model in available_models.data])
+        player.tell(f"Available models: {formatted_models}")
+
+    def cmd_switch_model(self, player, msg, _channel):
+        if len(msg) != 2:
+            return minqlx.RET_USAGE
+
+        self._switch_model_in_thread(player, msg[1])
+        return minqlx.RET_NONE
+
+    @minqlx.thread
+    def _switch_model_in_thread(self, player, model):
+        async def _list_models_async():
+            client = AsyncOpenAI(api_key=self.bot_api_key)
+            return await client.models.list()
+
+        available_models = asyncio.run(_list_models_async())
+        available_model_names = [model.id for model in available_models.data]
+
+        if model not in available_model_names:
+            formatted_models = ", ".join(available_model_names)
+            player.tell(f"Model {model} not available. Currently using {self.model}")
+            player.tell(f"Available models are: {formatted_models}")
+            return
+
+        if model == self.model:
+            player.tell(f"I'm already using {self.model}, no switch necessary.")
+            return
+
+        self.model = model
+        player.tell(f"Switched to openai model {self.model}")
